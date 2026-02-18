@@ -1,0 +1,43 @@
+---
+title: "Covariate EDA"
+output: html_document
+date: "2026-02-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(tigris)
+library(ggplot2)
+
+
+```
+
+##Central Valley Boundaries
+```{r}
+# anna's boundaries https://github.com/anna-boser/ET_ag_OpenET/tree/main/data/1_raw/study_area
+cv <- st_read("scratch/study_area/study_area.shp")
+plot(cv)
+
+ca <- tigris::counties("ca", class = "sf")
+
+cv <- st_transform(cv, st_crs(ca))
+
+ggplot() +
+  geom_sf(data = ca, fill = "lightgrey", color = "white") +
+  geom_sf(data = cv, fill = "lightblue", alpha = .8) +
+  theme_void()
+
+# USGS boundaries https://www.sciencebase.gov/catalog/item/6314056bd34e36012efa2bf4
+hydro <- st_read("scratch/pp1766_Alluvial_Bnd/Alluvial_Bnd.shp")
+
+hydro <- st_transform(hydro, st_crs(ca))
+
+ggplot() +
+  geom_sf(data = ca, fill = "lightgrey", color = "white") +
+  geom_sf(data = hydro, fill = "blue", alpha = .8) + # alluvial boundary
+  geom_sf(data = cv, fill = "lightblue", alpha = .8) + # from anna's study
+  theme_void()
+```
+
