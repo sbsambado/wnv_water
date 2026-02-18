@@ -1,4 +1,11 @@
-.Rproj.user
+# R temporary files
 .Rhistory
 .RData
-.Ruserdata
+.Rproj.user/
+
+# macOS files
+.DS_Store
+
+# Scratch or raw data folders
+scratch/
+data/raw/
