@@ -1,0 +1,666 @@
+---
+title: "calsurv_raw_qc"
+output: html_document
+date: "2026-02-20"
+---
+
+**Purpose:** Transform raw CalSurv data into useable data
+
+**Tasks**
+- import data from google folder (don't save on local drive)
+- clean both abundance files, merge them
+- create clusterID (made up of indiivudal trap stations) based on abundance data from 2003-2023
+- make clusterID .shp file for covariate extraction (3 km buffers, 1.5 km radius)
+- create abundance panel data for all species (plotting) and individual culex species (panel models)
+- clean mir data
+- match mir trap stations with abundance trap stations (so i can avoid reprocessing environmental data)
+- create wnv mir panel data for all species (plotting) and individual culex species (panel models)
+
+
+**Files**
+- cluster_all_centroidsbuffer.shp = polygons to extract covariate data
+- stations_all_info.csv = specific info (county, lat, lon, total trap stations, clusterID)
+- abundance_all_clustered_raw.csv = abundance data for plotting (unfiltered)
+- abundance_*_clustered.csv = panel data for mos species (tar, pip, quin)
+- wnv_mir_allspecies_panel.csv = wnv mir for plotting
+- wnv_mir_*_panel.csv = panel data for mos species  (tar, pip, quin)
+
+
+**NOTE NONE OF THESE FINAL FILES ARE FILTERED FOR PEAK MONTHS OR KEY COUNTIES - NEED TO DO THAT FILTERIGN PRIOR TO FITTING PANEL MODELS**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## upload necessary packages
+library(googledrive)
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(tigris)
+library(tmap)
+library(lubridate)
+
+## upload ca shapefile
+options(tigris_use_cache = TRUE)
+ca <- tigris::counties("ca", class = "sf")
+
+```
+
+
+### A. Import data
+```{r}
+# authenticate google drive folder 
+# drive_auth()
+
+# direct to specific folder
+folder <- drive_get("data-000092")
+
+# make loop to call in multiple csvs
+read_drive_csv <- function(file_name, file_id) {
+  temp_path <- tempfile(fileext = ".csv") # only take csvs not the readmes
+  drive_download(as_id(file_id), path = temp_path, overwrite = TRUE)
+  df <- read_csv(temp_path)
+  message(paste("loaded:", file_name))
+  return(df)
+}
+
+# show me which files i've called in (this is a bit overkill for 3 files)
+g <- drive_ls(folder)
+files <- setNames(g$id, g$name)
+
+# make loop to give the object names
+for(name in names(files)) {
+  obj_name <- gsub("[^0-9a-zA-Z_]", "_", name)
+  assign(name, read_drive_csv(name, files[[name]]), envir = .GlobalEnv)
+}
+
+# okay a bit clunky - change names again
+# years 0323 = 2003-2023
+# years 0316 = 2003-2016
+# years 1723 = 2017-2023
+
+assign("mir_0323", get("data-000092_pool_2003-23.csv")) # WNV MIR
+assign("abundance_0316", get("data-000092_abundance_2003-16.csv")) # Abundance
+assign("abundance_1723", get("data-000092_abundance_2017-23.csv")) # Abundance
+
+```
+
+
+
+
+# Abundance Data
+
+
+## B. Wrangle raw abundance data
+(get a sense of whats in these files)
+
+**File 1: 2003-2016**
+```{r}
+abundance_0316_raw <- abundance_0316
+
+dim(abundance_0316_raw) # 934,837
+
+## which species are there?  
+abundance_0316_raw %>% 
+  group_by(species) %>% 
+  tally()
+#Cx pipiens	190305			
+#Cx quinquefasciatus	304920			
+#Cx tarsalis	297238			
+#NULL	142374	
+
+## which type of traps?
+abundance_0316_raw %>% 
+  group_by(trap) %>% 
+  tally() %>% 
+  arrange(desc(n))
+# top 6 trap types
+# Carbon dioxide baited trap	357024	(/2)		
+# Gravid trap	245136		(/1)	
+# New Jersey light trap	216546	(/4)		
+# Mosquito magnet trap	25657			
+# Oviposition Trap (counts)	22104	(/6)	
+# Household Inspection (counts)	19413			
+# BG Sentinel	10227		(/3)	
+# CDC Autocidal Gravid Ovitrap (counts)	10016		(/5)	
+# Oviposition Trap (presence/absence)	9722
+
+## which collection_type?
+abundance_0316_raw %>% 
+  group_by(collection_type) %>% 
+  tally()
+# NULL	142374		
+# abundance	792377				
+# presence	86
+
+## how many trap_problem_bit
+abundance_0316_raw %>% 
+  group_by(trap_problem_bit) %>% 
+  tally()
+# FALSE	926508			
+# TRUE	8329	
+
+## what is the sex
+abundance_0316_raw %>% 
+  group_by(sex) %>% 
+  tally()
+# Eggs	13			
+# Females - Bloodfed	13636			
+# Females - Gravid	46970			
+# Females - Mixed	480442			
+# Females - Unfed	72759			
+# Larvae	351			
+# Males	178216			
+# NULL	142374			
+# Pupae	6			
+# Unknown Sex	70	
+
+
+## filtered list for specific observations
+abundance_0316_filtered <- abundance_0316_raw %>% #934,837
+  filter(species != "NULL") %>% # 792,463
+  filter(collection_type == "abundance") %>% # 792,377
+  filter(trap_problem_bit != TRUE) %>% # 789,386 
+  filter(grepl("Females", sex)) # 611,538
+
+
+## now clean up dataset with necessary info 
+# get rid of trailing spacing 
+abundance_0316_filtered$num_clean <- as.numeric(gsub("[^0-9]", "", abundance_0316_filtered$num_count))
+
+abundance_0316_clean <- abundance_0316_filtered %>% 
+  mutate(date = as.Date(substr(collection_date,1,10)),
+         week = isoweek(date),
+         trapstation_id = paste0(sprintf("%.5f",latitude), "-", sprintf("%.5f",longitude))) %>% # i guess make my own trap ID based on lat/lon
+  dplyr::select(trapstation_id, collection_id, county, date, month, week, surv_year, latitude, longitude, species, trap_nights, num_clean)
+  
+## check for NAs
+abundance_0316_clean %>%  # 611,538 observations
+  #filter(is.na(num_clean)) %>% 
+  #filter(is.na(species)) %>% 
+  filter(is.na(date)) 
+
+
+length(unique(abundance_0316_clean$trapstation_id)) # 11025 unique trap stations
+ 
+unique(abundance_0316_clean$surv_year) # 14 years
+
+
+
+```
+
+**File 2: 2017-2023**
+```{r}
+abundance_1723_raw <- abundance_1723
+
+# how many obs
+dim(abundance_1723_raw) # 859,517
+
+
+## which species are there?  
+abundance_1723_raw %>% 
+  group_by(species) %>% 
+  tally()
+# Cx pipiens	125463
+# Cx pipiens/restuans/salinarius	12
+# Cx quinquefasciatus	404187	
+# Cx tarsalis	219791
+# NULL	110064	
+
+## which type of traps?
+abundance_1723_raw %>% 
+  group_by(trap) %>% 
+  tally() %>% 
+  arrange(desc(n))
+# top 6 trap types
+# Gravid trap	307950			--> female mos already taken blood meal/ready to lay eggs	(prop. eg laying females)	
+# Carbon dioxide baited trap	272256	--> host-seeking females (estimating mos abundance)
+# BG Sentinel	162699			--> aedes aegypti/albo (day biting container breeders)
+# New Jersey light trap	45146			--> general mos pop (espec cule, works better at night)
+# CDC Autocidal Gravid Ovitrap (counts)	29817			-- > gravid aedes mos
+# Oviposition Trap (counts)	17860	--> egges laid by aedes mosquiotes
+
+## which collection_type?
+abundance_1723_raw %>% 
+  group_by(collection_type) %>% 
+  tally()
+# NULL	110064			
+# abundance	749260			
+# presence	193	
+
+## how many trap_problem_bit
+abundance_1723_raw %>% 
+  group_by(trap_problem_bit) %>% 
+  tally()
+# FALSE	851582			
+# TRUE	7935	
+
+## what is the sex
+abundance_1723_raw %>% 
+  group_by(sex) %>% 
+  tally()
+# Eggs	51			
+# Females - Bloodfed	16936			
+# Females - Gravid	66650			
+# Females - Mixed	418548			
+# Females - Unfed	83815			
+# Larvae	23			
+# Males	163222			
+# NULL	110064			
+# Pupae	16			
+# Unknown Sex	192	
+
+## filtered list for specific observations
+abundance_1723_filtered <- abundance_1723_raw %>% 
+  filter(species != "NULL") %>% # 749,453
+  filter(collection_type == "abundance") %>% # 749,260
+  filter(trap_problem_bit != TRUE) %>% #745,894
+  filter(grepl("Females", sex)) #583,193 
+
+## now clean up dataset with necessary info 
+# get rid of trailing spacing 
+abundance_1723_filtered$num_clean <- as.numeric(gsub("[^0-9]", "", abundance_1723_filtered$num_count))
+
+abundance_1723_clean <- abundance_1723_filtered %>% 
+  # create mos per trap night
+  #mutate(mos_pertrapnight = (as.numeric(num_clean)/trap_nights)) %>% 
+  mutate(date = as.Date(substr(collection_date,1,10)),
+         week = isoweek(date),
+         trapstation_id = paste0(sprintf("%.5f",latitude), "-", sprintf("%.5f",longitude))) %>% # i guess make my own trap ID based on lat/lon
+  dplyr::select(trapstation_id, collection_id, county, date, month, week, surv_year, latitude, longitude, species, trap_nights, num_clean)
+  
+## check for NAs
+abundance_1723_clean %>% 
+  #filter(is.na(num_clean)) %>% 
+  #filter(is.na(species)) %>% 
+  filter(is.na(date)) 
+
+
+length(unique(abundance_1723_clean$trapstation_id)) # 30,337 unique trap stations
+unique(abundance_1723_clean$surv_year)  # 7 years
+
+```
+
+## C. Create cluster polygons
+
+step 1. Combine both files abundances so I can create standardized cluster polygons
+```{r}
+## this is not for mosquito data but trap station/cluster data
+
+all_traps <- bind_rows(abundance_0316_clean %>% distinct(county, trapstation_id, latitude, longitude),
+                       abundance_1723_clean %>% distinct(county, trapstation_id, latitude, longitude)) # 43,501 observations
+
+length(unique(all_traps$trapstation_id)) #36,660 unique trap stations
+
+## create unique trap locations for cluster
+all_traps_unique <- all_traps %>% # 36,660
+  group_by(county, trapstation_id) %>% 
+  summarise(latitude = first(latitude),
+            longitude = first(longitude), .groups = "drop") # traps have 1 single representative location
+
+```
+
+step 2. Make for loop to calculate distance btwn trap stations but do it county by county so my computer doesn't explode
+```{r}
+# create a list to hold counties
+stations_clustered_list <- list()
+counties <- unique(all_traps_unique$county)
+
+# make for loop to calc distance b/w trap stations within a county
+for (i in seq_along(counties)) {
+  
+  cty <- counties[i]
+  
+  # subset unique trap stations within county
+  stations <- all_traps_unique %>% 
+    filter(county == cty) 
+  
+  # make spatial dataset
+  stations_sf <- stations %>% 
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
+    st_transform(3310) # ca albers in meter
+  
+  ## Cluster creation
+  # complete linkage clustering for spatial compactness
+  dist_matrix <- as.matrix(st_distance(stations_sf))
+  hc <- hclust(as.dist(dist_matrix), method = "complete")
+  
+  # cut tree at 3 km diameter
+  stations$cluster_id <- cutree(hc, h = 3000) 
+  
+  # offset cluster ids to keep them unique across counties
+  stations$cluster_id <- stations$cluster_id + 10000 * (i-1)
+  
+  # keep county info
+  stations$county <- cty
+  
+  stations_clustered_list[[cty]] <- stations
+  
+}
+
+# combine all counties
+stations_all <- bind_rows(stations_clustered_list)
+
+#write.csv(stations_all, file = "data/processed/stations_all_info.csv")
+```
+
+step 3. Create 1.5 km radii buffer around unique clusterID
+```{r}
+## need to do some QCing for duplicates/make sure clusterIDs are spaced out
+
+# check duplicates
+stations_all %>% 
+  count(trapstation_id) %>% 
+  filter(n > 1) # 0
+
+
+# make 1 representative point per trap stations
+# (would be a problem if i had duplicates in previous lines of code)
+stations_all_unique <- stations_all %>%  # 36,660
+  distinct(trapstation_id, .keep_all = TRUE)
+
+## create 1.5 km buffer polygons to save for shapefile
+
+# i. create centroid per cluster
+cluster_points <- stations_all_unique %>% 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  group_by(cluster_id) %>% 
+  summarise(n_traps = n(), .groups = "drop") %>% 
+  st_centroid() %>% 
+  st_transform(3310) #convert to meters for distance calc
+
+# ii. create 1.5 km buffer radii
+cluster_buffer <- cluster_points %>% 
+  st_buffer(1500) %>% # 15000 m radius = 1.5 km radisu = 3 km diameter circle cluster
+  # make sure shp contains this metadata
+  mutate(cluster_id = cluster_points$cluster_id,
+         n_traps = cluster_points$n_traps)
+
+
+## save polygon file -- this is what I'll use for covariate extraction!
+#st_write(cluster_buffer, "data/processed/cluster_all_centroidsbuffer/cluster_all_centroidsbuffer.shp")
+```
+
+## D. Combine mosquito data w/ clusterID
+(keep raw data for plotting, make species data for panel models)
+```{r}
+### KEEP FOR RAW DATA -- helpful for plotting
+# combine clean abundance + clusterID
+abundance_all_clustered <- bind_rows(abundance_0316_clean, abundance_1723_clean) %>% # 1,194,731
+  left_join(stations_all_unique %>% dplyr::select(trapstation_id, cluster_id), by = "trapstation_id") %>% 
+  # reorganize this a bit into how i like it
+  dplyr::select(county, cluster_id, trapstation_id, # spatial info
+                date, surv_year, month, week,  # temporal info
+                species, num_clean, trap_nights,  # mos info
+                latitude, longitude, collection_id) # extra
+
+# save file -- this is what I'll use to whiddle down to tarsalis vs quinq or specific females/trap types
+#write.csv(abundance_all_clustered, "data/processed/abundance_all_clustered_raw.csv")
+
+
+### KEEP FOR PANEL DATA (make for each species)
+abundance_tar_clustered <- abundance_all_clustered  %>% 
+  filter(species == "Cx tarsalis") %>% 
+  group_by(county, cluster_id, surv_year, month) %>% 
+  summarise(n_traps = n_distinct(trapstation_id),
+            total_mos = sum(num_clean, na.rm = TRUE),
+            total_trap_nights = sum(trap_nights, na.rm = TRUE),
+            mos_per_trap_night = total_mos/ total_trap_nights, .groups = "drop") %>% 
+  arrange(county, cluster_id, surv_year, month) %>% 
+  mutate(species = "Cx. tarsalis")
+
+#write.csv(abundance_tar_clustered, file = "data/processed/abundance_tar_clustered.csv")
+
+
+abundance_pip_clustered <- abundance_all_clustered  %>% 
+  filter(species == "Cx pipiens") %>% 
+  group_by(county, cluster_id, surv_year, month) %>% 
+  summarise(n_traps = n_distinct(trapstation_id),
+            total_mos = sum(num_clean, na.rm = TRUE),
+            total_trap_nights = sum(trap_nights, na.rm = TRUE),
+            mos_per_trap_night = total_mos/ total_trap_nights, .groups = "drop") %>% 
+  arrange(county, cluster_id, surv_year, month) %>% 
+  mutate(species = "Cx. pipiens")
+
+#write.csv(abundance_pip_clustered, file = "data/processed/abundance_pip_clustered.csv")
+
+
+abundance_quin_clustered <- abundance_all_clustered  %>% 
+  filter(species == "Cx quinquefasciatus") %>% 
+  group_by(county, cluster_id, surv_year, month) %>% 
+  summarise(n_traps = n_distinct(trapstation_id),
+            total_mos = sum(num_clean, na.rm = TRUE),
+            total_trap_nights = sum(trap_nights, na.rm = TRUE),
+            mos_per_trap_night = total_mos/ total_trap_nights, .groups = "drop") %>% 
+  arrange(county, cluster_id, surv_year, month) %>% 
+  mutate(species = "Cx. quinquefasciatus")
+
+#write.csv(abundance_quin_clustered, file = "data/processed/abundance_quin_clustered.csv")
+```
+
+## E. Summary stats
+(for all mosquitoes, but only April-Oct)
+```{r}
+#### filter for peak month and species
+abundance_all_clustered_filtered <- # 1,194,731
+  abundance_all_clustered %>% 
+  filter(species != "Cx pipiens/restuans/salinarius") %>% #1,194,719 
+  filter(month %in% 4:10) # 1,097,008
+  
+## total recorded observations
+dim(abundance_all_clustered_filtered)  # 1,097,008
+
+## total mosquitoes
+sum(abundance_all_clustered_filtered$num_clean) # 35,239,443
+  
+# by species
+abundance_all_clustered_filtered %>% 
+  group_by(species) %>% 
+  summarise(total = sum(num_clean,na.rm = TRUE))
+# Cx pipiens	5,540,250			
+# Cx quinquefasciatus	12,577,382			
+# Cx tarsalis	17,121,811	
+
+
+## total trap nights
+sum(abundance_all_clustered_filtered$trap_nights) # 2,373,199
+
+## total trap stations
+length(unique(abundance_all_clustered_filtered$trapstation_id)) # 35,696
+
+length(unique(abundance_all_clustered_filtered$cluster_id)) # 2841
+```
+
+
+# WNV MIR Data
+
+
+## B. Wrangle raw abundance data
+(get a sense of whats in these files)
+
+```{r}
+mir_0323_raw <- mir_0323
+
+dim(mir_0323_raw) # 1,014,528 
+
+## which species are there?  
+mir_0323_raw %>% 
+  group_by(species) %>% 
+  tally()
+# Cx pipiens	236,679			
+# Cx quinquefasciatus	379,031			
+# Cx tarsalis	398,818	
+
+
+## which type of traps?
+mir_0323_raw %>% 
+  group_by(trap) %>% 
+  tally() %>% 
+  arrange(desc(n))
+# top 6 traps
+# Carbon dioxide baited trap	589336			
+# Gravid trap	290520			
+# Unknown trap type	63420			
+# BG Sentinel	61384			
+# Underground storm drain system	2643			
+# Unspecified trap type	2227	
+
+
+## which test_target?
+mir_0323_raw %>% 
+  group_by(test_target) %>% 
+  tally()
+# SLEV	457,824			
+# WNV	556,704	
+
+## how many trap_problem_bit
+mir_0323_raw %>% 
+  group_by(test_status) %>% 
+  tally()
+# Confirmed	45,344			
+# Inconclusive	28			
+# Negative	966,975			
+# Other	2			
+# Pending	2,101			
+# Presumptive	78		
+
+
+## what is the sex
+mir_0323_raw %>%
+  group_by(sex) %>% 
+  tally()
+# Eggs	2			
+# Females - Bloodfed	366			
+# Females - Gravid	72,636			
+# Females - Mixed	821,964			
+# Females - Unfed	119,032			
+# Males	392			
+# Unknown Sex	136
+
+
+## filtered list for specific observations
+mir_0323_filtered <- mir_0323_raw %>% # 1,014,528
+  filter(test_status == "Confirmed" | test_status == "Negative") %>%  # 1,012,319
+  filter(grepl("Females", sex)) # 1,011,789 
+
+## now clean up dataset with necessary info 
+# get rid of trailing spacing 
+mir_0323_filtered$num_clean <- as.numeric(gsub("[^0-9]", "", mir_0323_filtered$num_count))
+
+mir_0323_clean <- mir_0323_filtered %>% 
+  mutate(date = as.Date(substr(collection_date,1,10)),
+         week = isoweek(date),
+         trapstation_id = paste0(sprintf("%.5f",latitude), "-", sprintf("%.5f",longitude))) %>% # i guess make my own trap ID based on lat/lon
+  dplyr::select(trapstation_id, pool_id, county, date, surv_year, month, week, latitude, longitude, 
+                species, num_clean, test_target, test_status)
+
+
+
+## check for NAs
+mir_0323_clean %>%  # 1,011,789  observations
+  #filter(is.na(num_clean)) %>% 
+  #filter(is.na(species)) %>% 
+  filter(is.na(date)) 
+
+
+length(unique(mir_0323_clean$pool_id)) # 551,835 unique pools
+length(unique(mir_0323_clean$trapstation_id))  # 18,438 unique trap stations
+
+unique(mir_0323_clean$surv_year) # 21 years
+```
+
+
+## Connect to ClusterID
+
+(want to have same clusterIDs as abundance just so i dont have to reprocesses environmental data twice)
+```{r}
+## find which MIR trap stations DONT match abundance clusters
+mir_not_abundance <- mir_0323_clean %>% 
+  distinct(trapstation_id) %>% 
+  anti_join(stations_all_unique %>% distinct(trapstation_id), by = "trapstation_id")
+
+dim(mir_not_abundance) # 769 
+
+# what proportion of them don't align with abundance
+length(unique(mir_not_abundance$trapstation_id))/length(unique(mir_0323_clean$trapstation_id)) # 0.04170734 --> 4% mismatch
+
+
+## okay i think i can just join and then drop observations who dont have matching clusterID
+mir_0323_clustered <- mir_0323_clean %>%
+  left_join(stations_all_unique %>% dplyr::select(trapstation_id, cluster_id), by = "trapstation_id") # 1,011,789
+
+## check which observations did not match to clusterID
+mir_0323_clustered %>% 
+  filter(is.na(cluster_id)) # 21,468 observations (most of these are LA and I will drop those for this paper anyways)
+
+# what proporiton is this
+21468/nrow(mir_0323_clustered) # 0.02121786 --> 2%
+
+## okay just drop this 2% not worth reprocessing spatial data
+mir_0323_clustered_clean <- mir_0323_clustered %>% 
+  filter(!is.na(cluster_id)) # 990,321
+
+
+# save file -- this is what I'll use to whiddle down to tarsalis vs quinq or specific females/trap types/test target (WNV/SLEV)
+#write.csv(mir_0323_clustered_clean, "data/processed/mir_all_clustered_raw.csv")
+```
+
+
+## Make WNV MIR by species
+```{r}
+#### first make WNV only dataset 
+## save main WNV file (come back to this if i want to do something with SLEV)
+wnv_mir_allspecies <- mir_0323_clustered_clean %>% 
+  filter(test_target == "WNV") 
+
+#write.csv(wnv_mir_allspecies, file = "data/processed/wnv_mir_allspecies.csv")
+
+#### second, calculate MIR - keep in 1 file for plotting
+## make panel data prior to calculating
+wnv_mir_allspecies_panel <- wnv_mir_allspecies %>% 
+  group_by(county, cluster_id, surv_year, month, species) %>% 
+  summarise(n_traps = n_distinct(trapstation_id),
+            total_pools = n(),
+            positive_pools = sum(test_status == "Confirmed", na.rm = TRUE),
+            total_mos_tested = sum(num_clean, na.rm = TRUE),
+            WNV_MIR = ifelse(total_mos_tested > 0,
+                             (positive_pools / total_mos_tested) * 1000, NA_real_), .groups = "drop") %>% 
+  arrange(county, cluster_id, surv_year, month, species)
+
+#write.csv(wnv_mir_allspecies_panel, file = "data/processed/wnv_mir_allspecies_panel.csv")
+
+
+## check
+# table(wnv_mir_allspecies$test_status)
+summary(wnv_mir_allspecies_panel$total_mos_tested)
+hist(wnv_mir_allspecies_panel$WNV_MIR)
+unique(wnv_mir_allspecies_panel$WNV_MIR)
+
+
+#### third - make species species for panel model
+# total obs 130,245
+wnv_mir_tar_panel <- wnv_mir_allspecies_panel %>% filter(species == "Cx tarsalis") # 46,749
+wnv_mir_pip_panel <- wnv_mir_allspecies_panel %>% filter(species == "Cx pipiens") # 28,485
+wnv_mir_quin_panel <- wnv_mir_allspecies_panel %>% filter(species == "Cx quinquefasciatus") # 55,011
+
+
+#write.csv(wnv_mir_tar_panel, file = "data/processed/wnv_mir_tar_panel.csv")
+#write.csv(wnv_mir_pip_panel, file = "data/processed/wnv_mir_pip_panel.csv")
+#write.csv(wnv_mir_quin_panel, file = "data/processed/wnv_mir_quin_panel.csv")
+
+```
+
+(i messed up and should have saved these to a mos & trap station subfolder)
+```{r}
+
+dir.create("data/processed/trapstations", showWarnings = FALSE)
+trap_files <- list.files(path = "data/processed/", pattern = "cluster|station", full.names = TRUE)
+file.rename(from = trap_files, to = file.path("data/processed/trapstations/", basename(trap_files)))
+
+
+dir.create("data/processed/mosquito", showWarnings = FALSE)
+mosq_files <- list.files(path = "data/processed/",pattern = "abundance|mir", full.names = TRUE)
+file.rename(from = mosq_files, to = file.path("data/processed/mosquito/", 
+                                              basename(mosq_files)))
+```
+
