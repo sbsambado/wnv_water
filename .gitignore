@@ -9,3 +9,13 @@
 # Scratch or raw data folders
 scratch/
 data/raw/
+
+#figures for now
+outputs/figures
+
+#ignore any build outputs
+*.html
+*.pdf
+
+# ignore eda files
+eda_figures.Rmd
