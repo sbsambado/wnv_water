@@ -3,6 +3,32 @@
 .RData
 .Rproj.user/
 
+
+# macOS files
+.DS_Store
+
+# Scratch or raw data folders
+scratch/
+data/raw/
+data/processed/mosquito_local/
+
+#figures for now
+outputs/figures
+
+#ignore any build outputs
+*.html
+*.pdf
+
+# ignore eda files
+eda_figures.Rmd
+
+
+# Ignore large mosquito CSVs
+data/processed/mosquito/abundance_all_clustered_raw.csv
+data/processed/mosquito/mir_all_clustered_raw.csv
+data/processed/mosquito/wnv_mir_allspecies.csv
+
+
 # macOS files
 .DS_Store
 
