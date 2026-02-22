@@ -1,0 +1,187 @@
+---
+title: "covariate extraction"
+output: html_document
+date: "2026-02-22"
+---
+
+**Purpose:** Pull down covariate data & wrangle into panel model data structure
+
+**Tasks**
+- import data, wrangle into monthly values, extract bird info, and format bird data into year-month-cluster df
+
+**Files**
+- data/processed/bird_local/bird_panel_fullCA.csv = year-month-cluster for ALL CA counties (-99 for LA/Orange)
+- 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## upload necessary packages
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(googledrive)
+library(exactextractr)
+
+## upload station data
+cluster_shp <- st_read("data/processed/trapstations/cluster_all_centroidsbuffer/cluster_all_centroidsbuffer.shp")
+cluster_info <- read.csv("data/processed/trapstations/stations_all_info.csv")
+
+## upload ca shapefile
+options(tigris_use_cache = TRUE)
+ca <- tigris::counties("ca", class = "sf")
+```
+
+
+# Bird community competence
+https://drive.google.com/drive/u/0/folders/1FgDkejWqE12rlvV5OiGxAyov5qkYbhq2
+
+### A. Import data
+```{r}
+# authenticate google drive folder 
+# drive_auth()
+
+# direct to specific folder
+folder <- drive_get("bird community")
+
+# make loop to call in multiple csvs
+read_drive_tif <- function(file_name, file_id) {
+  temp_path <- tempfile(fileext = ".tif") # not the pngs
+  drive_download(as_id(file_id), path = temp_path, overwrite = TRUE)
+  r <- terra::rast(temp_path)
+  message(paste("loaded:", file_name))
+  return(r)
+}
+
+# show me which files i've called in (this is a bit overkill for 3 files)
+g <- drive_ls(folder) %>% 
+  filter(grepl("\\.tif", name, ignore.case = TRUE))
+
+files <- setNames(g$id, g$name)
+
+# make loop to give the object names
+for(name in names(files)) {
+  obj_name <- gsub("\\.tif$", "", name)
+  assign(obj_name, read_drive_tif(name, files[[name]]), envir = .GlobalEnv)
+}
+
+```
+
+### B. Wrangle data
+```{r}
+## add all rasters to 1 list
+
+# a. create named list of all years
+year_rasters <- lapply(names(files), function(name) {
+  obj_name <- gsub("\\.tif$", "", name)
+  get(obj_name, envir = .GlobalEnv)
+})
+
+names(year_rasters) <- gsub("\\.tif$", "", names(files))
+
+# b. convert weekly (52 layers) rasters to monthly (12 layers) values
+# assign 4–5 weeks per month
+weeks_to_month <- list(month_01 = 1:4,
+                       month_02 = 5:8,
+                       month_03 = 9:13,
+                       month_04 = 14:17,
+                       month_05 = 18:21,
+                       month_06 = 22:26,
+                       month_07 = 27:30,
+                       month_08 = 31:35,
+                       month_09 = 36:39,
+                       month_10 = 40:44,
+                       month_11 = 45:48,
+                       month_12 = 49:52)
+
+
+# c. aggregate to months
+monthly_rasters <- lapply(year_rasters, function(r) {
+  
+  # for each month, computer mean across week
+  monthly <- lapply(weeks_to_month, function(weeks){
+    terra::app(r[[weeks]], fun = mean, na.rm = TRUE)})
+  
+  # combine into 1 spatraster per year
+  terra::rast(monthly)})
+
+```
+
+### C. Merge bird spatial data with cluster polygons
+```{r}
+## a. deal with CRS
+cluster_vect <- vect(st_transform(cluster_shp, crs(monthly_rasters[[1]])))
+
+## b. write funciton to extract motnly averages per cluster
+extract_monthly_bird <- function(monthly_rasters, cluster_vect) {
+  
+  # store
+  results <- list()
+  
+  # for each year in the raster stack
+  for(year_name in names(monthly_rasters)) {
+    
+    r <- monthly_rasters[[year_name]] #rembered went from 52 to 12 layer raster
+    
+    # extract bird community competence mean
+    avg_vals <- terra::extract(r, cluster_vect, fun = mean, na.rm = TRUE)
+    
+    # replace NA (polygons outside raster with -99) this is temporary until i figure out which mos to keep
+    # mostly LA, Orange, Riverside counties
+    avg_vals[is.na(avg_vals)] <- -99
+    
+    # story with cluster_id
+    avg_vals_df <- data.frame(cluster_id = cluster_shp$cluster_id,
+                              year = year_name,
+                              avg_vals)
+    
+    results[[year_name]] <- avg_vals_df
+  }
+  
+  # combine all years
+  do.call(rbind, results)
+}
+
+
+## c. run the loop
+bird_cluster <- extract_monthly_bird(monthly_rasters, cluster_vect)
+```
+
+### D. Clean up data for panel models
+```{r}
+## convert from wide to long to match panel data
+bird_panel <- data.frame(bird_cluster, row.names = NULL) %>% 
+  mutate(year = as.numeric(substr(as.character(year), nchar(year)-3, nchar(year)))) %>% 
+  pivot_longer(cols = starts_with("month_"),
+               names_to = "month",
+               values_to = "bird_competence") %>% 
+  mutate(month = sub("month_", "", month)) %>% 
+  dplyr::select(cluster_id, year, month, bird_competence)
+  
+# save raw data before any spatial filtering is made
+#write.csv(bird_panel, "data/processed/bird_local/bird_panel_fullCA.csv", row.names = FALSE)
+
+
+## check to see how it merges with cluster info
+bird_panel %>% 
+  group_by(cluster_id) %>% 
+  slice(1) %>% # only take 1 obs since bird is for all year-months
+  left_join(cluster_info, by = "cluster_id") %>% 
+  # check if -99 is applied to the right places outsdie CV
+  filter(bird_competence == -99 & 
+           county != "Los Angeles" & county != "Riverside" & 
+           county != "Orange" & county != "Placer" &
+           county != "Shasta")
+
+## okay so it looks like the culprit counties make up majority of -99 (null values bc bird rasters dont exist there)
+# theres a couple sac/yuba but i'm not too worried 
+
+```
+
+
+# Temperature 
+```{r}
+
+
+
+```
+

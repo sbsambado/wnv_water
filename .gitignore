@@ -52,3 +52,6 @@ eda_figures.Rmd
 data/processed/mosquito/abundance_all_clustered_raw.csv
 data/processed/mosquito/mir_all_clustered_raw.csv
 data/processed/mosquito/wnv_mir_allspecies.csv
+
+# ignore large bird
+data/processed/bird_local/
