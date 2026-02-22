@@ -55,3 +55,7 @@ data/processed/mosquito/wnv_mir_allspecies.csv
 
 # ignore large bird
 data/processed/bird_local/
+
+# Ignore CHELSA raw and cropped rasters
+data/raw/CHELSA_tas/
+data/processed/CHELSA_tas_ca/
